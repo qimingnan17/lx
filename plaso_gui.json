@@ -1,0 +1,16 @@
+{
+ "root": "C:\\Users\\dhx18\\Downloads\\plaso",
+ "dir": "C:\\Users\\dhx18\\Downloads\\plaso\\liveclass\\plaso\\14148\\23323864_1789173970087a3_ag4\\a1",
+ "out": "",
+ "only": "",
+ "workers": 6,
+ "interval": 300,
+ "watch": false,
+ "no_cdn": false,
+ "no_cache": false,
+ "dry": false,
+ "merge": false,
+ "force": true,
+ "refresh": false,
+ "geometry": "1180x760+320+130"
+}
