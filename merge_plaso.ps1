@@ -17,10 +17,27 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 
 $local = Join-Path $Dir "local.m3u8"
 
+# Encrypted (EXT-X-KEY) or fMP4 (EXT-X-MAP) playlists must go through the HLS
+# demuxer; raw concat would produce garbage or fail.
+$needsPlaylist = $false
+if (Test-Path -LiteralPath $local) {
+    $text = Get-Content -LiteralPath $local -Raw
+    if ($text -match '#EXT-X-MAP' -or $text -match '#EXT-X-KEY:(?![^\r\n]*METHOD=NONE)') {
+        $needsPlaylist = $true
+    }
+}
+
 $numbered = @(Get-ChildItem -LiteralPath $Dir -Filter "*.ts" -File |
     Where-Object { $_.BaseName -match '^\d+$' })
 
-if ($numbered.Count -gt 0) {
+if ($needsPlaylist) {
+    Write-Host "Playlist is encrypted or fMP4, merging via local.m3u8..."
+    & ffmpeg -y -hide_banner -loglevel warning -stats `
+        -allowed_extensions ALL -protocol_whitelist "file,crypto,data" `
+        -i $local -c copy $Out
+    if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed (exit $LASTEXITCODE)" }
+}
+elseif ($numbered.Count -gt 0) {
     $sorted = $numbered | Sort-Object { [int64]$_.BaseName }
     $numbers = @($sorted | ForEach-Object { [int64]$_.BaseName })
     $min = $numbers[0]
@@ -66,8 +83,8 @@ else {
     $fs = [IO.File]::Create($outTs)
     try {
         foreach ($part in $parts) {
-            $input = [IO.File]::OpenRead($part.FullName)
-            try { $input.CopyTo($fs) } finally { $input.Dispose() }
+            $src = [IO.File]::OpenRead($part.FullName)
+            try { $src.CopyTo($fs) } finally { $src.Dispose() }
         }
     }
     finally {

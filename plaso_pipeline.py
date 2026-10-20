@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import posixpath
+import random
 import re
 import shutil
 import subprocess
@@ -19,10 +20,31 @@ DEFAULT_CACHE = os.path.join(
     os.path.expanduser("~"), "AppData", "Roaming", "plaso_client", "Cache", "Cache_Data"
 )
 DEFAULT_BASE = "https://filecdn.plaso.com"
+# The client falls back to this mirror; same paths, same files. Opt-in (--mirror).
+MIRROR_BASES = ("https://filecdn-t.plaso.com",)
+# Mimic the Plaso desktop client (Electron 24 / Chromium 112) so CDN fills look
+# like ordinary playback traffic rather than a script.
+CLIENT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/112.0.5615.204 Electron/24.8.8 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN",
+    "sec-ch-ua": '"Not:A-Brand";v="99", "Chromium";v="112"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
 MAP_NAME = ".plaso_map.json"
+LOCK_NAME = ".plaso_map.lock"
 LOG_NAME = "plaso_pipeline.log"
 TS_PACKET = 188
 EXTINF_RE = re.compile(r"#EXTINF:([0-9.]+)")
+KEY_TAG_RE = re.compile(r"#EXT-X-KEY:(.*)")
+METHOD_RE = re.compile(r"METHOD=([A-Za-z0-9-]+)")
 
 
 def log(session_dir, message):
@@ -64,6 +86,68 @@ def save_map(path, data):
     os.replace(tmp, path)
 
 
+def acquire_lock(lock_path, timeout=10.0):
+    """Cross-process lock shared with plaso_reqable_save.py (same file name)."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_path) > 30:
+                    os.remove(lock_path)
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.02)
+
+
+def release_lock(lock_path):
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
+
+
+def update_map(path, mutate):
+    """Re-read the map under lock, apply mutate(data), save. Avoids clobbering
+    entries written concurrently by the Reqable capture script."""
+    lock_path = os.path.join(os.path.dirname(path), LOCK_NAME)
+    locked = acquire_lock(lock_path)
+    try:
+        try:
+            data = load_map(path)
+        except (OSError, ValueError):
+            data = {"segments": {}, "next": 1}
+        mutate(data)
+        save_map(path, data)
+        return data
+    finally:
+        if locked:
+            release_lock(lock_path)
+
+
+def playlist_features(session_dir):
+    """Return (encrypted, has_init) for local.m3u8."""
+    path = os.path.join(session_dir, "local.m3u8")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False, False
+    encrypted = False
+    for m in KEY_TAG_RE.finditer(text):
+        method = METHOD_RE.search(m.group(1))
+        if method and method.group(1).upper() != "NONE":
+            encrypted = True
+            break
+    return encrypted, "#EXT-X-MAP" in text
+
+
 def media_paths(segments):
     exts = (".ts", ".m4s", ".m4a", ".aac", ".mp4", ".key")
     return [p for p in segments if os.path.splitext(p)[1].lower() in exts]
@@ -88,14 +172,15 @@ def ts_intact(path, size):
     return sync == b"\x47" * (size // TS_PACKET)
 
 
-def valid_media(path, ext):
+def valid_media(path, ext, strict=True):
+    """strict=False skips the TS sync-byte check (encrypted segments have none)."""
     try:
         size = os.path.getsize(path)
     except OSError:
         return False
     if size <= 0:
         return False
-    if ext.lower() == ".ts":
+    if strict and ext.lower() == ".ts":
         return ts_intact(path, size)
     return True
 
@@ -312,7 +397,8 @@ def merge(session_dir, out, force, names=None, total_dur=0.0, tc=None, on_progre
         raise RuntimeError("no segments to merge")
     nums = sorted(n for n in (numbered(x) for x in names) if n is not None)
     if nums:
-        gaps = [i for i in range(nums[0], nums[-1] + 1) if i not in set(nums)]
+        seen = set(nums)
+        gaps = [i for i in range(nums[0], nums[-1] + 1) if i not in seen]
         if gaps:
             log(session_dir, f"merge: WARNING {len(gaps)} gaps: {ranges(gaps)}")
     if os.path.exists(out) and not force:
@@ -321,22 +407,36 @@ def merge(session_dir, out, force, names=None, total_dur=0.0, tc=None, on_progre
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    list_path = write_concat_list(session_dir, names)
     tmp = out + ".part.mp4"
+    encrypted, has_init = playlist_features(session_dir)
+    list_path = None
+    if encrypted or has_init:
+        # Encrypted (EXT-X-KEY) or fMP4 (EXT-X-MAP) streams cannot be joined by
+        # raw concat: let ffmpeg's HLS demuxer decrypt / prepend the init segment.
+        source = ["-allowed_extensions", "ALL",
+                  "-protocol_whitelist", "file,crypto,data",
+                  "-i", os.path.join(session_dir, "local.m3u8")]
+        how = "hls"
+    else:
+        list_path = write_concat_list(session_dir, names)
+        source = ["-f", "concat", "-safe", "0", "-i", list_path]
+        how = "concat"
     cmd = (
-        ["ffmpeg", "-hide_banner", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
+        ["ffmpeg", "-hide_banner", "-y"]
+        + source
         + ffmpeg_args(tc)
         + ["-progress", "pipe:1", "-nostats", tmp]
     )
     mode = "transcode" if tc and tc.get("codec") != "copy" else "remux"
-    log(session_dir, f"merge: {mode} {len(names)} segments -> {out}")
+    log(session_dir, f"merge: {mode} ({how}) {len(names)} segments -> {out}")
     try:
         code, tail = run_ffmpeg(cmd, session_dir, total_dur, on_progress)
     finally:
-        try:
-            os.remove(list_path)
-        except OSError:
-            pass
+        if list_path:
+            try:
+                os.remove(list_path)
+            except OSError:
+                pass
     if code != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         try:
             os.remove(tmp)
@@ -382,6 +482,8 @@ def verify(session_dir, data, paths, args):
     ok = True
     segments = data["segments"]
     sizes = data.get("sizes") or {}
+    encrypted, _ = playlist_features(session_dir)
+    strict = not encrypted
     meta = playlist_meta(os.path.join(session_dir, "local.m3u8"))
     names = [segments[p] for p in paths]
 
@@ -423,8 +525,11 @@ def verify(session_dir, data, paths, args):
         if expected and os.path.getsize(dest) != expected:
             bad.append(name)
             continue
-        if not valid_media(dest, os.path.splitext(name)[1]):
+        if not valid_media(dest, os.path.splitext(name)[1], strict):
             bad.append(name)
+    for name in (data.get("assets") or {}).values():
+        if not valid_media(os.path.join(session_dir, name), os.path.splitext(name)[1]):
+            missing.append(name)
 
     if sizes:
         log(session_dir, f"verify: recorded sizes for {len(sizes)} segments")
@@ -473,20 +578,15 @@ def verify(session_dir, data, paths, args):
     return 0 if ok else 2
 
 
-def fetch_one(url, dest, timeout, retries):
+def fetch_one(url, dest, timeout, retries, jitter=(0.0, 0.0)):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     last = None
     for attempt in range(retries + 1):
         tmp = dest + ".part"
+        if jitter[1] > 0:
+            time.sleep(random.uniform(*jitter))
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "*/*",
-                    "Cache-Control": "no-cache",
-                },
-            )
+            req = urllib.request.Request(url, headers=dict(CLIENT_HEADERS))
             with opener.open(req, timeout=timeout) as resp:
                 if resp.status != 200:
                     raise OSError(f"HTTP {resp.status}")
@@ -508,12 +608,13 @@ def fetch_one(url, dest, timeout, retries):
             except OSError:
                 pass
             if attempt < retries:
+                time.sleep(min(10, 2 ** attempt))
                 continue
     return False, str(last)
 
 
 def build_cache_map(args, paths, session_dir):
-    prefix = args.base + common_dir(paths)
+    prefix = args.base + common_dir([p for p in paths if p.startswith("/")])
     try:
         cache = CacheReader(args.cache_dir)
     except (OSError, CacheError) as exc:
@@ -536,7 +637,7 @@ def build_cache_map(args, paths, session_dir):
     return cache, cache_map
 
 
-def cache_pass(session_dir, segments, paths, cache, cache_map, dry):
+def cache_pass(session_dir, segments, paths, cache, cache_map, dry, strict=True):
     existing = 0
     from_cache = 0
     missing = []
@@ -544,7 +645,7 @@ def cache_pass(session_dir, segments, paths, cache, cache_map, dry):
         name = segments[path]
         dest = os.path.join(session_dir, name)
         ext = os.path.splitext(name)[1]
-        if valid_media(dest, ext):
+        if valid_media(dest, ext, strict):
             existing += 1
             continue
         entry = cache_map.get(path)
@@ -553,7 +654,7 @@ def cache_pass(session_dir, segments, paths, cache, cache_map, dry):
                 from_cache += 1
                 continue
             if cache.copy_body(entry, dest):
-                if valid_media(dest, ext):
+                if valid_media(dest, ext, strict):
                     from_cache += 1
                     log(session_dir, f"cache fill: {name}")
                     continue
@@ -576,10 +677,13 @@ def main():
     parser.add_argument("--base", default=DEFAULT_BASE)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-cdn", action="store_true")
+    parser.add_argument("--mirror", action="store_true")
+    parser.add_argument("--delay-min", type=float, default=0.5)
+    parser.add_argument("--delay-max", type=float, default=2.0)
     parser.add_argument("--merge", action="store_true")
     parser.add_argument("--out", default="")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--limit", type=int, default=0)
@@ -612,9 +716,18 @@ def main():
 
 
 def fill(args, map_path, session_dir, data, paths):
-    segments = data["segments"]
+    # Keys / fMP4 init segments ("assets") are fetched alongside media segments.
+    assets = data.get("assets") or {}
+    segments = dict(assets)
+    segments.update(data["segments"])
+    paths = list(paths) + [p for p in assets if p not in data["segments"]]
+    encrypted, _ = playlist_features(session_dir)
+    strict = not encrypted
+    if encrypted:
+        log(session_dir, "playlist is encrypted (EXT-X-KEY): skipping TS sync check")
     cache = None
     cache_map = {}
+    existing, from_cache, missing = 0, 0, []
     if not args.no_cache:
         cache, cache_map = build_cache_map(args, paths, session_dir)
 
@@ -627,7 +740,7 @@ def fill(args, map_path, session_dir, data, paths):
                 if not args.no_cache:
                     cache, cache_map = build_cache_map(args, paths, session_dir)
                 existing, from_cache, missing = cache_pass(
-                    session_dir, segments, paths, cache, cache_map, False
+                    session_dir, segments, paths, cache, cache_map, False, strict
                 )
                 log(
                     session_dir,
@@ -641,7 +754,7 @@ def fill(args, map_path, session_dir, data, paths):
             log(session_dir, "watch: stopped by user")
     else:
         existing, from_cache, missing = cache_pass(
-            session_dir, segments, paths, cache, cache_map, args.dry_run
+            session_dir, segments, paths, cache, cache_map, args.dry_run, strict
         )
 
     log(session_dir, f"existing {existing}, cache {from_cache}, missing {len(missing)}")
@@ -665,8 +778,28 @@ def fill(args, map_path, session_dir, data, paths):
         def work(item):
             path, name, ext = item
             dest = os.path.join(session_dir, name)
-            url = args.base + urllib.parse.quote(path, safe="/-_.~")
-            ok, err = fetch_one(url, dest, args.timeout, args.retries)
+            if path.startswith(("http://", "https://")):
+                urls = [path]
+            else:
+                quoted = urllib.parse.quote(path, safe="/-_.~")
+                bases = [args.base]
+                if getattr(args, "mirror", False):
+                    bases += [b for b in MIRROR_BASES if b != args.base]
+                urls = [b + quoted for b in bases]
+            ok, err = False, None
+            for url in urls:
+                ok, err = fetch_one(
+                    url, dest, args.timeout, args.retries,
+                    (args.delay_min, args.delay_max),
+                )
+                if ok and ext.lower() == ".ts" and strict and not valid_media(dest, ext):
+                    ok, err = False, "not a valid TS stream"
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                if ok:
+                    break
             return path, name, ext, ok, err
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -679,31 +812,34 @@ def fill(args, map_path, session_dir, data, paths):
         if failed:
             log(session_dir, f"cdn failed {len(failed)}")
 
-    sizes = data.get("sizes")
-    if not isinstance(sizes, dict):
-        sizes = {}
-        data["sizes"] = sizes
-    changed = False
+    known = data.get("sizes") if isinstance(data.get("sizes"), dict) else {}
+    new_sizes = {}
     for path in paths:
         name = segments[path]
-        if name in sizes:
+        if name in known:
             continue
         dest = os.path.join(session_dir, name)
         try:
             size = os.path.getsize(dest)
         except OSError:
             continue
-        if size > 0 and valid_media(dest, os.path.splitext(name)[1]):
-            sizes[name] = size
-            changed = True
-    if changed:
-        save_map(map_path, data)
-        log(session_dir, f"recorded sizes: {len(sizes)}")
+        if size > 0 and valid_media(dest, os.path.splitext(name)[1], strict):
+            new_sizes[name] = size
+    if new_sizes:
+        def add_sizes(fresh):
+            sizes = fresh.get("sizes")
+            if not isinstance(sizes, dict):
+                sizes = {}
+                fresh["sizes"] = sizes
+            for k, v in new_sizes.items():
+                sizes.setdefault(k, v)
+        data = update_map(map_path, add_sizes)
+        log(session_dir, f"recorded sizes: {len(data.get('sizes') or {})}")
 
     remaining = []
     for path in paths:
         name = segments[path]
-        if not valid_media(os.path.join(session_dir, name), os.path.splitext(name)[1]):
+        if not valid_media(os.path.join(session_dir, name), os.path.splitext(name)[1], strict):
             remaining.append(name)
 
     if cache:
@@ -720,11 +856,11 @@ def fill(args, map_path, session_dir, data, paths):
     )
     log(session_dir, "complete")
     if args.merge:
-        all_names = [segments[p] for p in media_paths(segments)]
+        all_names = [data["segments"][p] for p in media_paths(data["segments"])]
         absent = [
             n
             for n in all_names
-            if not valid_media(os.path.join(session_dir, n), os.path.splitext(n)[1])
+            if not valid_media(os.path.join(session_dir, n), os.path.splitext(n)[1], strict)
         ]
         if absent:
             nums = sorted(n for n in (numbered(x) for x in absent) if n is not None)

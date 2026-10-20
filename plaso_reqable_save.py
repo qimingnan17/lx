@@ -8,7 +8,7 @@ import time
 import traceback
 import urllib.parse
 
-HOST = "filecdn.plaso.com"
+HOSTS = ("filecdn.plaso.com", "filecdn-t.plaso.com")
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "plaso")
 MEDIA_EXTS = (".ts", ".m4s", ".m4a", ".aac", ".mp4", ".key")
 MAP_NAME = ".plaso_map.json"
@@ -257,7 +257,7 @@ def onResponse(context, response):
 def _on_response(context, response):
     url = context.url or ""
     parsed = urllib.parse.urlparse(url)
-    if parsed.hostname != HOST:
+    if parsed.hostname not in HOSTS:
         return response
     path = urllib.parse.unquote(parsed.path)
     name = os.path.basename(path)

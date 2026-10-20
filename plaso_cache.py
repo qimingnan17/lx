@@ -9,6 +9,18 @@ BLOCK_SIZES = {1: 36, 2: 256, 3: 1024, 4: 4096, 5: 8, 6: 104, 7: 48}
 KEY_PREFIX_RE = re.compile(r"^\d+/\d+/")
 
 
+def url_of_key(key):
+    """Strip Chromium cache key prefixes and return the bare URL.
+
+    Handles plain keys ("1/0/https://...") and split-cache / double-keyed
+    entries ("1/0/_dk_https://site https://site https://host/path").
+    """
+    key = KEY_PREFIX_RE.sub("", key)
+    if key.startswith("_dk_") or " " in key:
+        key = key.rsplit(" ", 1)[-1]
+    return key
+
+
 class CacheError(Exception):
     pass
 
@@ -202,10 +214,8 @@ class CacheReader:
         entry = self._find_key(("1/0/" + url).encode())
         if entry:
             return entry
-        target = url.encode()
         for entry in self.iter_entries():
-            key = KEY_PREFIX_RE.sub("", entry["key"].decode("utf-8", "replace"))
-            if key.encode() == target:
+            if url_of_key(entry["key"].decode("utf-8", "replace")) == url:
                 return entry
         return None
 
@@ -216,7 +226,7 @@ class CacheReader:
                 key = entry["key"].decode("utf-8")
             except UnicodeDecodeError:
                 continue
-            url = KEY_PREFIX_RE.sub("", key)
+            url = url_of_key(key)
             if not url.startswith(("http://", "https://")):
                 continue
             if prefix and not url.startswith(prefix):

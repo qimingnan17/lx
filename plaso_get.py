@@ -17,13 +17,16 @@ from plaso_pipeline import (
     DEFAULT_CACHE,
     EXTINF_RE,
     MAP_NAME,
+    LOCK_NAME,
+    acquire_lock,
+    CLIENT_HEADERS,
     add_transcode_args,
-    default_out,
     fill,
     find_map,
     find_out,
     load_map,
     log,
+    release_lock,
     media_paths,
     merge,
     save_map,
@@ -37,7 +40,9 @@ SOURCE_M3U8 = "source.m3u8"
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), "Downloads", "plaso")
 SKIP_TAGS = ("#EXT-X-MEDIA-SEQUENCE", "#EXT-X-ENDLIST", "#EXT-X-PLAYLIST-TYPE")
 SEQ_RE = re.compile(r"#EXT-X-MEDIA-SEQUENCE:(\d+)")
-UA = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
+ASSET_TAGS = ("#EXT-X-KEY", "#EXT-X-MAP", "#EXT-X-SESSION-KEY")
+UA = CLIENT_HEADERS
 
 
 def open_cache(args, quiet=False):
@@ -318,6 +323,19 @@ def build_session(args, reader, url, text, source):
 
     header, blocks = parse_blocks(text)
     map_file = os.path.join(session_dir, MAP_NAME)
+    lock_path = os.path.join(session_dir, LOCK_NAME)
+    locked = acquire_lock(lock_path)
+    try:
+        return _build_session_locked(
+            args, reader, url, text, source, session_dir, header, blocks, map_file
+        )
+    finally:
+        if locked:
+            release_lock(lock_path)
+
+
+def _build_session_locked(args, reader, url, text, source, session_dir, header, blocks, map_file):
+    playlist_dir = posixpath.dirname(urllib.parse.urlparse(url).path) + "/"
     data = {"segments": {}, "next": 1}
     if os.path.exists(map_file):
         try:
@@ -326,6 +344,38 @@ def build_session(args, reader, url, text, source):
             print(f"existing map unreadable, starting fresh: {exc}", file=sys.stderr)
             data = {"segments": {}, "next": 1}
     segments = data["segments"]
+    assets = data.get("assets")
+    if not isinstance(assets, dict):
+        assets = {}
+        data["assets"] = assets
+
+    def localize_asset(match, tag):
+        uri = match.group(1)
+        if uri.startswith(("data:", "skd:")):
+            return match.group(0)
+        absolute = urllib.parse.urljoin(url, uri)
+        parsed_abs = urllib.parse.urlparse(absolute)
+        if parsed_abs.netloc == urllib.parse.urlparse(url).netloc:
+            key = urllib.parse.unquote(parsed_abs.path)
+        else:
+            key = absolute  # different host (e.g. key server): fetch by full URL
+        name = assets.get(key)
+        if name is None:
+            kind = "init" if tag == "#EXT-X-MAP" else "key"
+            ext = os.path.splitext(key)[1] or (".mp4" if kind == "init" else ".key")
+            name = f"{kind}_{len(assets) + 1:03d}{ext}"
+            assets[key] = name
+        return f'URI="{name}"'
+
+    def rewrite_tags(lines):
+        for i, line in enumerate(lines):
+            tag = line.split(":", 1)[0]
+            if tag in ASSET_TAGS:
+                lines[i] = URI_ATTR_RE.sub(lambda m: localize_asset(m, tag), line)
+
+    rewrite_tags(header)
+    for block in blocks:
+        rewrite_tags(block)
     added = 0
     for block in blocks:
         key = urllib.parse.unquote(
@@ -500,7 +550,10 @@ def add_common(p):
 
 def add_fill(p):
     p.add_argument("--no-cdn", action="store_true")
-    p.add_argument("--workers", type=int, default=6)
+    p.add_argument("--mirror", action="store_true")
+    p.add_argument("--delay-min", type=float, default=0.5)
+    p.add_argument("--delay-max", type=float, default=2.0)
+    p.add_argument("--workers", type=int, default=2)
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--only", default="")

@@ -68,7 +68,7 @@ class App:
         self.v_out = tk.StringVar()
         self.v_only = tk.StringVar()
         self.v_title = tk.StringVar()
-        self.v_workers = tk.IntVar(value=6)
+        self.v_workers = tk.IntVar(value=2)
         self.v_interval = tk.IntVar(value=300)
         self.v_tc = tk.BooleanVar(value=False)
         self.v_codec = tk.StringVar(value="libx264")
