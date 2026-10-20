@@ -220,11 +220,45 @@ def playlist_meta(path):
     }
 
 
+def segment_durations(session_dir):
+    """Map local segment name -> EXTINF duration from local.m3u8."""
+    out = {}
+    try:
+        with open(os.path.join(session_dir, "local.m3u8"), "r", encoding="utf-8",
+                  errors="replace") as f:
+            lines = [l.strip() for l in f]
+    except OSError:
+        return out
+    dur = None
+    for line in lines:
+        m = EXTINF_RE.match(line)
+        if m:
+            dur = float(m.group(1))
+        elif line and not line.startswith("#"):
+            if dur is not None:
+                out[line] = dur
+            dur = None
+    return out
+
+
+def tool(name):
+    """Prefer an ffmpeg/ffprobe shipped next to the program, then PATH."""
+    exe = name + (".exe" if os.name == "nt" else "")
+    roots = [os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                             else __file__))]
+    for root in roots:
+        for sub in ("", "ffmpeg", os.path.join("ffmpeg", "bin")):
+            cand = os.path.join(root, sub, exe)
+            if os.path.isfile(cand):
+                return cand
+    return shutil.which(name) or name
+
+
 def probe_duration(path):
     try:
         out = subprocess.run(
             [
-                "ffprobe",
+                tool("ffprobe"),
                 "-v",
                 "error",
                 "-show_entries",
@@ -422,7 +456,7 @@ def merge(session_dir, out, force, names=None, total_dur=0.0, tc=None, on_progre
         source = ["-f", "concat", "-safe", "0", "-i", list_path]
         how = "concat"
     cmd = (
-        ["ffmpeg", "-hide_banner", "-y"]
+        [tool("ffmpeg"), "-hide_banner", "-y"]
         + source
         + ffmpeg_args(tc)
         + ["-progress", "pipe:1", "-nostats", tmp]
@@ -680,6 +714,9 @@ def main():
     parser.add_argument("--mirror", action="store_true")
     parser.add_argument("--delay-min", type=float, default=0.5)
     parser.add_argument("--delay-max", type=float, default=2.0)
+    parser.add_argument("--pace", choices=("playback", "jitter"), default="playback")
+    parser.add_argument("--speed", type=float, default=4.0)
+    parser.add_argument("--cdn-max", type=int, default=0)
     parser.add_argument("--merge", action="store_true")
     parser.add_argument("--out", default="")
     parser.add_argument("--force", action="store_true")
@@ -774,8 +811,21 @@ def fill(args, map_path, session_dir, data, paths):
         return 0
 
     failed = []
+    cdn_ok = 0
+    to_fetch = list(missing)
+    cdn_max = getattr(args, "cdn_max", 0) or 0
+    if missing and not args.no_cdn and cdn_max > 0 and len(missing) > cdn_max:
+        log(
+            session_dir,
+            f"cdn capped: fetching {cdn_max} of {len(missing)} missing; "
+            "replay the class in the client (with capture on) to collect the rest",
+        )
+        to_fetch = missing[:cdn_max]
+    pace = getattr(args, "pace", "jitter")
+    speed = max(0.5, float(getattr(args, "speed", 4.0) or 4.0))
+    durations = segment_durations(session_dir) if pace == "playback" else {}
     if missing and not args.no_cdn:
-        def work(item):
+        def work(item, jitter):
             path, name, ext = item
             dest = os.path.join(session_dir, name)
             if path.startswith(("http://", "https://")):
@@ -788,10 +838,7 @@ def fill(args, map_path, session_dir, data, paths):
                 urls = [b + quoted for b in bases]
             ok, err = False, None
             for url in urls:
-                ok, err = fetch_one(
-                    url, dest, args.timeout, args.retries,
-                    (args.delay_min, args.delay_max),
-                )
+                ok, err = fetch_one(url, dest, args.timeout, args.retries, jitter)
                 if ok and ext.lower() == ".ts" and strict and not valid_media(dest, ext):
                     ok, err = False, "not a valid TS stream"
                     try:
@@ -802,13 +849,31 @@ def fill(args, map_path, session_dir, data, paths):
                     break
             return path, name, ext, ok, err
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            for path, name, ext, ok, err in pool.map(work, missing):
-                if ok:
-                    log(session_dir, f"cdn fill: {name}")
-                else:
-                    failed.append((name, err))
-                    log(session_dir, f"cdn fail: {name}: {err}")
+        def report(result):
+            nonlocal cdn_ok
+            path, name, ext, ok, err = result
+            if ok:
+                cdn_ok += 1
+                log(session_dir, f"cdn fill: {name}")
+            else:
+                failed.append((name, err))
+                log(session_dir, f"cdn fail: {name}: {err}")
+
+        if pace == "playback":
+            # One request at a time, spaced like a player at `speed`x.
+            fallback = data.get("duration") and data.get("segment_count")
+            fallback = (data["duration"] / data["segment_count"]) if fallback else 10.0
+            log(session_dir, f"cdn pace: playback {speed:g}x, sequential")
+            for i, item in enumerate(to_fetch):
+                if i:
+                    dur = durations.get(to_fetch[i - 1][1], fallback)
+                    time.sleep(dur / speed * random.uniform(0.85, 1.15))
+                report(work(item, (0.0, 0.0)))
+        else:
+            jitter = (args.delay_min, args.delay_max)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+                for result in pool.map(lambda it: work(it, jitter), to_fetch):
+                    report(result)
         if failed:
             log(session_dir, f"cdn failed {len(failed)}")
 
@@ -852,7 +917,7 @@ def fill(args, map_path, session_dir, data, paths):
     log(
         session_dir,
         f"sources: capture/existing {existing}, cache {from_cache}, "
-        f"cdn {len(missing) - len(failed)}, failed {len(failed)}",
+        f"cdn {cdn_ok}, failed {len(failed)}",
     )
     log(session_dir, "complete")
     if args.merge:

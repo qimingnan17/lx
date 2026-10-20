@@ -10,14 +10,31 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+FROZEN = getattr(sys, "frozen", False)
+HERE = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
 GET_SCRIPT = os.path.join(HERE, "plaso_get.py")
+CAPTURE_SCRIPT = os.path.join(HERE, "plaso_capture.py")
 CONFIG_PATH = os.path.join(HERE, "plaso_gui.json")
 PYTHON = sys.executable or "python"
+
+
+# The packaged build ships a console twin (plaso-cli.exe) so piped output works.
+CLI_EXE = os.path.join(HERE, "plaso-cli.exe")
+
+
+def get_cmd():
+    """Command prefix for plaso_get (a sub-command of the packaged CLI when frozen)."""
+    return [CLI_EXE, "get"] if FROZEN else [PYTHON, GET_SCRIPT]
+
+
+def capture_cmd():
+    return [CLI_EXE, "capture"] if FROZEN else [PYTHON, CAPTURE_SCRIPT]
 DEFAULT_ROOT = os.environ.get("PLASO_DIR") or os.path.join(
     os.path.expanduser("~"), "Downloads", "plaso"
 )
-CREATE_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+CREATE_FLAGS = (
+    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+)
 
 RE_TOTAL = re.compile(r"segments (\d+),")
 RE_SUMMARY = re.compile(r"existing (\d+), cache (\d+), missing (\d+)")
@@ -84,9 +101,18 @@ class App:
         self.v_force = tk.BooleanVar(value=True)
         self.v_refresh = tk.BooleanVar(value=False)
         self.v_status = tk.StringVar(value="就绪")
+        self.v_pace = tk.StringVar(value="播放节奏")
+        self.v_speed = tk.DoubleVar(value=4.0)
+        self.v_cdn_max = tk.IntVar(value=50)
+        self.v_port = tk.IntVar(value=8899)
+        self.v_sysproxy = tk.BooleanVar(value=True)
+        self.v_cap_state = tk.StringVar(value="抓包：未运行")
+        self.cap_proc = None
+        self.proxy_backup = None
 
         self._build()
         self._load_config()
+        self._recover_proxy()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(80, self._poll)
         self.refresh()
@@ -134,6 +160,27 @@ class App:
         ttk.Button(bar, text="初始化", width=12, command=self.init_selected).pack(pady=2)
         ttk.Button(bar, text="打开目录", width=12, command=self.open_dir).pack(pady=2)
 
+        capf = ttk.LabelFrame(self.root, text="① 抓包（被动保存客户端自己的请求）  ② 缓存兜底  ③ CDN 补缺")
+        capf.pack(fill="x", padx=10, pady=6)
+        crow = ttk.Frame(capf)
+        crow.pack(fill="x", padx=8, pady=6)
+        ttk.Label(crow, text="端口").pack(side="left")
+        ttk.Spinbox(crow, from_=1024, to=65535, width=7, textvariable=self.v_port).pack(
+            side="left", padx=6
+        )
+        ttk.Checkbutton(crow, text="自动设置系统代理", variable=self.v_sysproxy).pack(
+            side="left", padx=(6, 12)
+        )
+        self.btn_cap = ttk.Button(crow, text="开始抓包", command=self.toggle_capture)
+        self.btn_cap.pack(side="left")
+        ttk.Button(crow, text="安装证书", command=self.install_cert).pack(side="left", padx=6)
+        self.btn_collect = ttk.Button(crow, text="一键收集", command=self.collect)
+        self.btn_collect.pack(side="left", padx=6)
+        ttk.Label(crow, textvariable=self.v_cap_state).pack(side="left", padx=(12, 0))
+        ttk.Label(
+            crow, text="一键收集 = 抓包 + 轮询缓存（不走 CDN），然后去客户端倍速播放"
+        ).pack(side="right")
+
         mid = ttk.LabelFrame(self.root, text="任务参数")
         mid.pack(fill="x", padx=10, pady=6)
 
@@ -172,6 +219,21 @@ class App:
         ttk.Entry(row3, textvariable=self.v_out, width=42).pack(side="left", padx=6)
         ttk.Button(row3, text="另存为…", command=self.pick_out).pack(side="left")
         ttk.Label(row3, text="留空则用课程名命名").pack(side="left", padx=(8, 0))
+
+        rowp = ttk.Frame(mid)
+        rowp.pack(fill="x", padx=8, pady=4)
+        ttk.Label(rowp, text="CDN 补缺节奏").pack(side="left")
+        ttk.Combobox(
+            rowp, textvariable=self.v_pace, width=9, state="readonly",
+            values=("播放节奏", "随机间隔"),
+        ).pack(side="left", padx=6)
+        ttk.Label(rowp, text="模拟倍速").pack(side="left", padx=(8, 0))
+        ttk.Spinbox(rowp, from_=1, to=16, increment=0.5, width=5,
+                    textvariable=self.v_speed).pack(side="left", padx=6)
+        ttk.Label(rowp, text="每次最多补").pack(side="left", padx=(8, 0))
+        ttk.Spinbox(rowp, from_=0, to=10000, increment=10, width=6,
+                    textvariable=self.v_cdn_max).pack(side="left", padx=6)
+        ttk.Label(rowp, text="段（0 = 不限）；播放节奏下并发设置无效").pack(side="left")
 
         row4 = ttk.Frame(mid)
         row4.pack(fill="x", padx=8, pady=(4, 8))
@@ -303,6 +365,8 @@ class App:
             ("workers", self.v_workers),
             ("interval", self.v_interval),
             ("crf", self.v_crf),
+            ("cdn_max", self.v_cdn_max),
+            ("port", self.v_port),
         ):
             if isinstance(cfg.get(key), int):
                 var.set(cfg[key])
@@ -315,9 +379,16 @@ class App:
             ("force", self.v_force),
             ("refresh", self.v_refresh),
             ("tc", self.v_tc),
+            ("sysproxy", self.v_sysproxy),
         ):
             if isinstance(cfg.get(key), bool):
                 var.set(cfg[key])
+        if cfg.get("pace") in ("播放节奏", "随机间隔"):
+            self.v_pace.set(cfg["pace"])
+        if isinstance(cfg.get("speed"), (int, float)):
+            self.v_speed.set(cfg["speed"])
+        if isinstance(cfg.get("proxy_backup"), dict):
+            self.proxy_backup = cfg["proxy_backup"]
         geo = cfg.get("geometry")
         if isinstance(geo, str) and geo:
             self.root.geometry(geo)
@@ -344,6 +415,12 @@ class App:
             "merge": self.v_merge.get(),
             "force": self.v_force.get(),
             "refresh": self.v_refresh.get(),
+            "pace": self.v_pace.get(),
+            "speed": self.v_speed.get(),
+            "cdn_max": self.v_cdn_max.get(),
+            "port": self.v_port.get(),
+            "sysproxy": self.v_sysproxy.get(),
+            "proxy_backup": self.proxy_backup,
             "geometry": self.root.geometry(),
         }
         try:
@@ -359,6 +436,7 @@ class App:
             ):
                 return
             self._kill_now()
+        self.stop_capture()
         self._save_config()
         self.root.destroy()
 
@@ -474,7 +552,7 @@ class App:
         threading.Thread(target=self._discover_worker, daemon=True).start()
 
     def _discover_worker(self):
-        cmd = [PYTHON, GET_SCRIPT, "discover", "--json"] + self._common_args()
+        cmd = get_cmd() + ["discover", "--json"] + self._common_args()
         try:
             out = subprocess.run(
                 cmd,
@@ -484,6 +562,7 @@ class App:
                 encoding="utf-8",
                 errors="replace",
                 env=child_env(),
+                creationflags=CREATE_FLAGS,
             )
         except OSError as exc:
             self.q.put(("line", f"[gui] 扫描失败: {exc}"))
@@ -628,6 +707,10 @@ class App:
             return
         args = ["fetch", "--dir", path] + self._common_args()
         args += ["--workers", str(self.v_workers.get())]
+        args += ["--pace", "playback" if self.v_pace.get() == "播放节奏" else "jitter"]
+        args += ["--speed", str(self.v_speed.get())]
+        if self.v_cdn_max.get() > 0:
+            args += ["--cdn-max", str(self.v_cdn_max.get())]
         if self.v_only.get().strip():
             args += ["--only", self.v_only.get().strip()]
         if self.v_watch.get():
@@ -671,7 +754,7 @@ class App:
         self._stream(args, "merge")
 
     def _stream(self, args, tag):
-        if not os.path.exists(GET_SCRIPT):
+        if not FROZEN and not os.path.exists(GET_SCRIPT):
             messagebox.showerror("缺少文件", f"找不到 {GET_SCRIPT}")
             return
         self._set_running(True)
@@ -680,7 +763,7 @@ class App:
         threading.Thread(target=self._worker, args=(args, tag), daemon=True).start()
 
     def _worker(self, args, tag):
-        cmd = [PYTHON, GET_SCRIPT] + args
+        cmd = get_cmd() + args
         lines = []
         try:
             proc = subprocess.Popen(
@@ -797,6 +880,126 @@ class App:
             self._save_config()
             threading.Thread(target=self._discover_worker, daemon=True).start()
 
+    # ------------------------------------------------------------ capture
+    def _recover_proxy(self):
+        """A previous run died while the system proxy pointed at us: restore it."""
+        if self.proxy_backup and os.name == "nt":
+            try:
+                import plaso_capture
+
+                plaso_capture.set_system_proxy(self.proxy_backup)
+                self.append("[gui] 检测到上次异常退出，已恢复系统代理设置")
+            except Exception as exc:  # noqa: BLE001
+                self.append(f"[gui] 恢复系统代理失败: {exc}")
+            self.proxy_backup = None
+            self._save_config()
+
+    def toggle_capture(self):
+        if self.cap_proc and self.cap_proc.poll() is None:
+            self.stop_capture()
+        else:
+            self.start_capture()
+
+    def start_capture(self):
+        if self.cap_proc and self.cap_proc.poll() is None:
+            return True
+        port = int(self.v_port.get())
+        cmd = capture_cmd() + ["--port", str(port), "--root",
+                               self.v_root.get().strip() or DEFAULT_ROOT]
+        try:
+            self.cap_proc = subprocess.Popen(
+                cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                env=child_env(), creationflags=CREATE_FLAGS,
+            )
+        except OSError as exc:
+            messagebox.showerror("抓包启动失败", str(exc))
+            return False
+        threading.Thread(target=self._cap_reader, args=(self.cap_proc,), daemon=True).start()
+        if self.v_sysproxy.get() and os.name == "nt":
+            try:
+                import plaso_capture
+
+                self.proxy_backup = plaso_capture.get_system_proxy()
+                self._save_config()
+                plaso_capture.enable_proxy(port)
+                self.append(f"[gui] 系统代理已指向 127.0.0.1:{port}")
+            except Exception as exc:  # noqa: BLE001
+                self.append(f"[gui] 设置系统代理失败: {exc}")
+        self.btn_cap.configure(text="停止抓包")
+        self.v_cap_state.set(f"抓包：运行中 :{port}")
+        self.append("[gui] 抓包已启动。首次使用请点“安装证书”，然后重启伯索客户端")
+        return True
+
+    def stop_capture(self):
+        proc = self.cap_proc
+        if self.proxy_backup is not None and os.name == "nt":
+            try:
+                import plaso_capture
+
+                plaso_capture.set_system_proxy(self.proxy_backup)
+                self.append("[gui] 系统代理已恢复")
+            except Exception as exc:  # noqa: BLE001
+                self.append(f"[gui] 恢复系统代理失败: {exc}")
+            self.proxy_backup = None
+            self._save_config()
+        if proc and proc.poll() is None:
+            try:
+                if os.name == "nt":
+                    os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+                else:
+                    proc.send_signal(signal.SIGINT)
+            except (OSError, ValueError):
+                proc.terminate()
+            threading.Thread(target=self._force_kill, args=(proc,), daemon=True).start()
+        self.cap_proc = None
+        self.btn_cap.configure(text="开始抓包")
+        self.v_cap_state.set("抓包：未运行")
+
+    def _cap_reader(self, proc):
+        try:
+            for line in proc.stdout:
+                self.q.put(("line", "[抓包] " + line.rstrip("\r\n")))
+        except (OSError, ValueError):
+            pass
+        code = proc.wait()
+        self.q.put(("cap_exit", code))
+
+    def install_cert(self):
+        if not (self.cap_proc and self.cap_proc.poll() is None):
+            self.append("[gui] 先启动一次抓包以生成证书…")
+            self.start_capture()
+            self.root.after(2500, self._install_cert_now)
+        else:
+            self._install_cert_now()
+
+    def _install_cert_now(self):
+        def run():
+            try:
+                out = subprocess.run(
+                    capture_cmd() + ["--install-cert"], cwd=HERE, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", env=child_env(),
+                    creationflags=CREATE_FLAGS,
+                )
+                for line in (out.stdout + out.stderr).splitlines():
+                    self.q.put(("line", "[证书] " + line))
+            except OSError as exc:
+                self.q.put(("line", f"[gui] 安装证书失败: {exc}"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def collect(self):
+        if self.running:
+            return
+        path = self._need_dir()
+        if not path:
+            return
+        if not self.start_capture():
+            return
+        args = ["fetch", "--dir", path, "--no-cdn", "--watch",
+                str(max(10, min(self.v_interval.get(), 60)))] + self._common_args()
+        self.append("[gui] 一键收集：去客户端打开这节课并倍速播放，收齐后自动停止轮询")
+        self._stream(args, "fetch")
+
     def _poll(self):
         try:
             while True:
@@ -811,13 +1014,17 @@ class App:
                     self.v_status.set(item[1])
                 elif kind == "exit":
                     self._handle_exit(item[1], item[2], item[3])
+                elif kind == "cap_exit":
+                    if self.cap_proc is not None and self.cap_proc.poll() is not None:
+                        self.append(f"[gui] 抓包进程已退出 (code {item[1]})")
+                        self.stop_capture()
         except queue.Empty:
             pass
         self.root.after(80, self._poll)
 
 
 def main():
-    if not os.path.exists(GET_SCRIPT):
+    if not FROZEN and not os.path.exists(GET_SCRIPT):
         print(f"missing dependency: {GET_SCRIPT}", file=sys.stderr)
         return 1
     root = tk.Tk()
